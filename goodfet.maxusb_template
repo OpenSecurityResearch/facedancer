@@ -1,0 +1,430 @@
+#!/usr/bin/env python
+'''
+ This aims to emulate a XXX 
+        Manufacturer: 
+        Model: 
+        Code: 
+        S/N 
+
+root@bt:~# lsusb -v -s 006:030
+
+'''
+import sys;
+import binascii;
+import array;
+import time;
+
+from ordereddict import *;
+
+from GoodFETMAXUSB import *;
+
+
+class GoodFETMAXUSB_NAMEME(GoodFETMAXUSBDevice):
+    usbverbose=True;
+
+    # Device specific Variables
+    instate=0; # Tracks standard state
+    
+    count48 = 1; # Tracks message specific state
+    m4cMsgCnt = 0; # Tracks 4c messages 
+    m4c03Cnt = 0; # Tracks 4c -> frame[15] (03) state
+    m4c03State = 0; # Tracks state of 03 messages
+    m4c03StateCnt = 0; # Counter for individual State
+    # Device Descriptor - Initialized with good omnikey values
+    devDesc = OrderedDict([     ("bLength",             0x12), # 18 
+                                ("bDescriptorType",     0x01), # 1
+                                ("bcdUSBL",             0x00), 
+                                ("bcdUSBH",             0x02), # 2.0
+                                ("bDeviceClass",        0x00), 
+                                ("bDeviceSubClass",     0x00),
+                                ("bDeviceProtocol",     0x00),
+                                ("bMaxPacketSize0",     0x40), # supposed to be 08
+                                ("idVendorL",           0x6b), # vid=0x076b
+                                ("idVerdorH",           0x07),
+                                ("idProductL",          0x21), # pid=0x5321
+                                ("idProductH",          0x53),
+                                ("bcdDeviceL",          0x10),
+                                ("bcdDeviceH",          0x05), # 5.10
+                                ("iManufacturer",       0x01),
+                                ("iProduct",            0x02),
+                                ("iSerialNumber",       0x00),
+                                ("bNumConfigurations",  0x01)
+                        ]);
+    # Config Descriptor - Initialized with good values
+    cfgDesc = OrderedDict([     ("bLength",             0x09),
+                                ("bDescriptorType",     0x02),
+                                ("wTotalLengthL",       0x27), # should be 0x5d
+                                ("wTotalLengthH",       0x00),
+                                ("bNumInterfaces",      0x01),
+                                ("bConfigValue",        0x01),
+                                ("iConfiguration",      0x03), # CCID
+                                ("bmAttributes",        0xa0), # should be 0xa0 
+                                ("bMaxPower",            0x7d) # 250mA
+                          ]);
+    # Interface Descriptor - Initialized with upek values
+    intDesc     = OrderedDict([ ("bLength",             0x09),
+                                ("bDescriptorType",     0x04),
+                                ("bInterfaceNumber",    0x00), 
+                                ("bAlternateSetting",   0x00),
+                                ("bNumEndpoints",       0x03), # Note this
+                                ("bInterfaceClass",     0x0B),
+                                ("bInterfaceSubClass",  0x00),
+                                ("bInterfaceProtocol",  0x00),
+                                ("iInterface",          0x00),
+                          ]);
+    # OmniKey Has EP3-IN, EP4-IN, EP5-OUT
+    #  To make this work with the facedancer, we'll do this:
+    #       EP3-IN mapped to EP2-IN 
+    #       EP4-IN mapped to EP3-IN
+    #       EP5-OUT mapped to EP1-OUT
+    #   
+    #   Keep this in mind when dealing with registers
+
+    # Endpoint Variables
+    EP0IN   = 0x80;
+    EP0OUT  = 0x00;
+    EP1IN   = 0x81;
+    EP1OUT  = 0x01
+    EP2IN   = 0x82;
+    EP2OUT  = 0x02;
+    EP3IN   = 0x83;
+    EP3OUT  = 0x03;
+
+    # Adjustment:
+    EP5OUT  = EP1OUT;
+    EP4IN   = EP3IN;
+    EP3IN   = EP2IN;
+
+    # Endpoint Descriptor -  Initialized with EP3-IN values
+    epDesc = OrderedDict([      ("bLength",             0x07),
+                                ("bDescriptorType",     0x05),  # Endpoint
+                                ("bEndpointAddress",    EP3IN),  # EP3-IN
+                                ("bmAttributes",        0x03),  # Interrupt
+                                ("wMaxPacketSizeL",     0x40),  # supposed to be 8 bytes
+                                ("wMaxPacketSizeH",     0x00),
+                                ("bInterval",           0x18)   # 24ms
+                        ]);
+    
+    # Build "In" Endpoint (to match the omnikey's EP3-IN)
+    ep3inDesc = epDesc.copy();
+
+    # Build "In" Endpoint (to match the omnikey's EP4-IN)
+    ep4inDesc = epDesc.copy();
+    ep4inDesc["bEndpointAddress"] = EP4IN;  # EP4-IN
+    ep4inDesc["bmAttributes"] = 0x02;      # Bulk
+    ep4inDesc["wMaxPacketSizeL"] = 0x40;   # 64
+    ep4inDesc["bInterval"] = 0x00;         # 0
+
+    # Build "Out" Endpoint (to match EP5-OUT)
+    ep5outDesc = epDesc.copy();
+    ep5outDesc["bEndpointAddress"] = EP5OUT;   # EP5-OUT
+    ep5outDesc["bmAttributes"] = 0x02;       # Bulk
+    ep5outDesc["wMaxPacketSizeL"] = 0x40;    # 64
+    ep5outDesc["wMaxPacketSizeH"] = 0x00;
+    ep5outDesc["bInterval"] = 0x00;          # 0
+
+    # Reserved list for Device descriptor
+    DD = [];
+
+    # Reserved list for Configuration Descriptor (which
+    # contains Endpoint Descriptor)
+    CD = [];
+
+    # Start the String Descriptor, actual strings are appended
+    strDesc = [ "\x04\x03\x09\x04" ]; # (0x04=Len; 0x03=Type(String); 0x09,0x04=Lang(English=US)
+
+    # Reserved string list for UPEK reader string
+    # (Some string thats queried outside of the standard USB
+    # string descriptors)
+    rdrStr = []; 
+
+    # Build a Descriptor (needs improvement)
+    # shouldnt have so many values
+    def getDescriptor(self, pDsc, aDsc0, aDsc1, aDsc2, aDsc3):
+        oList = [];
+        for i in pDsc.itervalues():
+            oList.append(i);
+        if aDsc0:
+            if type(aDsc0) == type(list()): # support list type for aDsc0
+                for i in aDsc0:
+			        oList.append(i);
+            else:
+                for i in aDsc0.itervalues():
+                    oList.append(i);
+        if aDsc1:
+            if type(aDsc1) == type(list()): # support list type for aDsc1
+                for i in aDsc1:
+                    oList.append(i);
+            else:
+                for i in aDsc1.itervalues():
+                    oList.append(i);
+        if aDsc2:
+            for i in aDsc2.itervalues():
+                oList.append(i);
+        if aDsc3:
+            for i in aDsc3.itervalues():
+                oList.append(i);
+        return oList;
+
+    def getUnicode(self,iString): # input String
+        strLen = len(iString);
+        if strLen < 127:
+            oString = [ strLen * 2 + 2, 0x03 ]; # 0x03 = DescriptorType 
+            for c in iString:
+                oString.append(ord(c));
+                oString.append(0x00);
+            return oString;
+        else:
+            oString = [ 0xFF, 0x03 ];
+            count = 0;
+            for c in iString:
+                oString.append(ord(c));
+                oString.append(0x00);
+                count+=1;
+                if count >= 127:
+                    break;
+            return oString; 
+
+    def getUnicodeStr(self,iString):
+        strLen = len(iString);
+        if strLen < 127:
+            oString = chr(strLen * 2 + 2) + "\x03"; # 0x03 = DescriptorType
+            for c in iString:
+                oString += c;
+                oString += "\x00";
+            return oString;
+        else:
+            count = 0;
+            oString = "\xFF" + "\x03"; # 0x03 = DescriptorType
+            for c in iString:
+                oString += c;
+                oString += "\x00";
+                count+=1;
+                if count >= 127:
+                    break;
+            return oString;
+
+    def buildDescStrings(self):
+
+    	# Device Descriptor
+        self.DD = self.getDescriptor(self.devDesc, None, None, None, None);
+	print "Device Descriptor:"
+	print self.DD
+
+        # Configuration Descriptor (Includes Interface and Endpoints)
+        self.CD = self.getDescriptor(self.cfgDesc, self.intDesc, self.ep3inDesc, self.ep4inDesc, self.ep5outDesc);
+	print "Configuration Descriptor:"
+	print self.CD
+
+        # String Descriptor
+        sDsc1 = self.getUnicodeStr("OMNIKEY");                  # Default iManufacturer
+        sDsc2 = self.getUnicodeStr("Smart Card Reader USB");    # Default iProduct
+	sDsc3 = self.getUnicodeStr("CCID");
+        print "Setting iManufacturer: " + sDsc1[2:];
+        print "Setting iProduct: " + sDsc2[2:];
+        self.strDesc.append(sDsc1);
+        self.strDesc.append(sDsc2);
+        self.strDesc.append(sDsc3);
+	print self.strDesc
+
+        return; 
+
+    """This emulates the DFU USB to Serial chips."""
+    def fifo_ep3in_tx_verbose(self,data):
+        """Sends the data out of EP3 in 64-byte chunks."""
+        #Wait for the buffer to be free before starting.
+        while not(self.rreg(rEPIRQ)&bmIN3BAVIRQ): pass;
+
+        count=len(data);
+        if self.usbverbose:
+            print "fifocount = ",count
+        pos=0;
+        while count>0:
+            #Send 64-byte chunks or the remainder.
+            c=min(count,64);
+            self.writebytes(rEP3INFIFO,
+                            data[pos:pos+c]);
+            self.wregAS(rEP3INBC,c);
+            count=count-c;
+            pos=pos+c;
+
+            epirq = self.rreg(rEPIRQ);
+            #Wait for the buffer to be free before continuing.
+            if self.usbverbose:
+                print "Checking EPIRQ [c=%i][count=%i][pos=%i][rEPIRQ=%02x]" % (c,count, pos, epirq),;
+            #while 1:
+            if epirq&bmSUDAVIRQ: print "Setup Data IRQ!"; return;
+            #elif epirq&bmOUT1DAVIRQ: print "OUT1-OUT IRQ!"; return;
+            elif epirq&bmIN3BAVIRQ: pass; # print "- FREED![%02x]" % (self.rreg(rEPIRQ));
+
+        return;
+
+    def init(self):
+        self.usb_disconnect();
+        time.sleep(1);
+
+        self.buildDescStrings();
+
+        self.usb_connect();
+        self.run();
+    def run(self,):
+        print "Starting a OmniKey device";
+        sys.stdout.flush();
+
+        #Run the service loop.
+        while 1:
+            self.service_irqs();
+    def do_SETUP(self):
+        """Handle USB Enumeration"""
+        #Grab the SETUP packet from the buffer.
+        SUD=self.readbytes(rSUDFIFO,8);
+        #Parse the SETUP packet
+        setuptype=(ord(SUD[bmRequestType])&0x60);
+        if setuptype==0x00:
+            self.std_request(SUD);
+        elif setuptype==0x20:
+            self.class_request(SUD);
+        elif setuptype==0x40:
+            self.vendor_request(SUD);
+        else:
+            print "Unknown request type 0x%02x." % ord(SUD[bmRequestType])
+            self.STALL_EP0(SUD);
+    def std_request(self,SUD):
+        """Handles a standard setup request."""
+        setuptype=ord(SUD[bRequest]);
+        print "Standard Setup Request [%02x]"%setuptype
+        if setuptype==SR_GET_DESCRIPTOR: self.send_descriptor(SUD);
+        elif setuptype==SR_SET_CONFIGURATION: self.set_configuration(SUD);
+        elif setuptype==SR_GET_STATUS: self.get_status(SUD);
+        elif setuptype==SR_SET_ADDRESS: self.rregAS(rFNADDR);
+        elif setuptype==SR_GET_INTERFACE: self.get_interface(SUD);
+        elif setuptype==SR_CLEAR_FEATURE: self.clear_feature(SUD); # ENDPOINT_HALT
+        else:
+            print "Stalling Unknown standard setup request type %02x" % setuptype;
+            self.STALL_EP0(SUD);
+        return
+    def clear_feature(self,SUD):
+        feature=ord(SUD[wValueH]);
+        if feature==0x00:
+            # 02 01 00 00 81 00 00 00
+            print "Got ENDPOINT_HALT for %02x - Resetting State" % ord(SUD[wIndexL]);
+            self.instate=0;
+            self.fstr_count=1;
+            #time.sleep(15);
+        elif feature==0x01:
+            # 00 01 01 00 00 00 00 00
+            print "Got DEVICE_REMOTE_WAKEUP!"
+        else:
+            print "Unknown feature for clear feature: %02x" % feature;
+    def get_interface(self,SUD):
+        """Handles a setup request for SR_GET_INTERFACE."""
+        print "In get_interface"
+        if ord(SUD[wIndexL]==0):
+            self.wreg(rEP0FIFO,0);
+            self.wregAS(rEP0BC,1);
+        else:
+            self.STALL_EP0(SUD);
+
+    def set_configuration(self,SUD):
+        """Set the configuration."""
+        print "In set_configuration"
+        bmSUSPIE=0x10;
+        configval=ord(SUD[wValueL]);
+        if(configval>0):
+            self.SETBIT(rUSBIEN,bmSUSPIE);
+        self.rregAS(rFNADDR);
+    def get_status(self,SUD):
+        """Get the USB Setup Status."""
+        testbyte=ord(SUD[bmRequestType])
+        print "In Get Status"
+        #Toward Device
+        if testbyte==0x80:
+            self.wreg(rEP0FIFO,0x03); #Enable RWU and self-powered
+            self.wreg(rEP0FIFO,0x00); #Second byte is always zero.
+            self.wregAS(rEP0BC,2);    #Load byte count, arm transfer, and ack CTL.
+        #Toward Interface
+        elif testbyte==0x81:
+            self.wreg(rEP0FIFO,0x00);
+            self.wreg(rEP0FIFO,0x00); #Second byte is always zero.
+            self.wregAS(rEP0BC,2);
+        #Toward Endpoint
+        elif testbyte==0x82:
+            if(ord(SUD[wIndexL])==0x83):
+                self.wreg(rEP0FIFO,0x01); #Stall EP3
+                self.wreg(rEP0FIFO,0x00); #Second byte is always zero.
+                self.wregAS(rEP0BC,2);
+            else:
+                self.STALL_EP0(SUD);
+        else:
+            self.STALL_EP0(SUD);
+    def service_irqs(self):
+        """Handle USB interrupt events."""
+        epirq=self.rreg(rEPIRQ);
+        usbirq=self.rreg(rUSBIRQ);
+        #Are we being asked for setup data?
+        if(epirq&bmSUDAVIRQ): #Setup Data Requested
+            self.wreg(rEPIRQ,bmSUDAVIRQ); #Clear the bit
+            self.do_SETUP();
+        elif(epirq&bmOUT1DAVIRQ): #OUT1-OUT packet
+            self.do_OUT5();
+            self.wregAS(rEPIRQ,bmOUT1DAVIRQ); #Clear the bit *AFTER* servicing.
+    def buildResp(self, frame, respPayload):
+        """ This is just an example for a specific device """
+        respHeader = [ 0x83 ];
+        respSize = [ len(respPayload) ];
+        if ord(frame[10]) == 0x4c: cmdResp = [ 0x02, 0x00 ];
+        elif ord(frame[10]) == 0x4a: cmdResp = [ 0x42, 0xad ];
+        return respHeader + respSize + [ 0x00, 0x00, 0x00, 0x00 ] + [ ord(frame[6]) ] + cmdResp + [ 0x00 ] + respPayload
+
+    def do_IN4(self,frame):
+        """Handle IN4 input event."""
+        """ This is where you implement all of the communication sent between the device and host everything here is just an example """
+        do_reply = False;
+        bulk_response = False;
+
+        if ord(frame[0]) == 0x6B:
+            print "EP4-IN:\tGot 0x6B from EP5-OUT"
+            do_reply=True;
+            #response =      [ 0x83 ];
+            if self.instate == 1:
+                print "EP4-IN:\t\tIn State 1..";
+            else:
+                print "EP4-IN:\t\tIn State Default...";
+                if ord(frame[10]) == 0x01: payload = [ 0x01, 0x01, 0x00, 0x05, 0x10, 0x03, 0x28, 0xf3 ];
+                elif ord(frame[10]) == 0x0f: payload = [ 0x0f, 0x00, 0x02, 0x00, 0x03, 0xac, 0x00, 0x00, 0xff, 0xff, 0xff ];
+                elif ord(frame[10]) == 0x46: payload = [ 0x46, ord(frame[11]), 0x06 ];   
+                else: payload = [ ord(frame[10]) ];
+                response = self.buildResp(frame, payload);
+        if ord(frame[0]) == 0x65:
+            print "EP4-IN:\tGot 0x65 EP5-OUT";
+            do_reply=True;
+            response = [ 0x81 ];
+            response += [ 0x00 ] * 5;
+            response += [ ord(frame[6]) ];
+            response += [ 0x02, 0x00, 0x01 ];
+
+        if do_reply:
+            print "EP4-IN:\t\tSending response! [%d]" % len(response);
+            if bulk_response:
+                self.fifo_ep3in_tx(response);
+            else:
+                self.writebytes(rEP3INFIFO,response);
+                self.wregAS(rEP3INBC,len(response));
+            print "-----------------------------------------------";
+        return
+    def do_OUT5(self):
+        """Handle an EP5-OUT output event."""
+        l=self.rreg(rEP1OUTBC);
+        frame=self.readbytesAS(rEP1OUTFIFO,l);
+        print "EP5-OUT: ", binascii.hexlify(frame);
+        self.do_IN4(frame);
+        return
+
+#Initialize FET and set baud rate
+client=GoodFETMAXUSBOMNI();
+client.serInit()
+
+client.MAXUSBsetup();
+
+print "Goooo!"
+client.init()

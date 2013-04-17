@@ -1,0 +1,31 @@
+Facedancer Client Scripts 
+by brad.antoniewicz@foundstone.com
+---------------------------------------------------
+
+
+I use this scripts pretty regularly when working with
+the facedancer. They're provided as-is but should
+work with minimal modification. 
+
+
+
+createStringsFromVMWareLog.py - 
+    This script parses a VMWare.log file and produces
+    "strings" files. When trying to recreate the communication
+    between an endpoint and a host, there are often huge
+    packets sent back and forth. This scripts eases that 
+    process to a certain extent. At the end of the day
+    its up to you to include the file as part of your 
+    gootfet.maxusb client. Right now this really just
+    supports one active endpoint. :/
+
+goodfet.maxusb_template - 
+    This is templated goodfet.maxusb client to be modified
+    immediately for your project. It break things up a little
+    neater and [for me] makes it easier to get things done 
+    faster. Make sure you modify the do_IN4() appropriately,
+    that will be the meat of client. You can change the name
+    to more appropriately fit your scenario. 
+
+
+
